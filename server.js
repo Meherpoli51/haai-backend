@@ -135,7 +135,67 @@ async function deductCredits(userId, amount, action, metadata = {}) {
 // ════════════════════════════════════════════════════════════════════════════
 
 // Health check (no auth)
-app.get('/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
+// ── GET /health ───────────────────────────────────────────────────────────────
+app.get('/health', (req, res) => res.json({ ok: true, ts: Date.now(), version: '2.0' }));
+
+// ── POST /api/gate — verify gate password securely ───────────────────────────
+// Passwords never stored in frontend — verified server-side only
+const GATE_USERS = {
+  [process.env.ADMIN_PASSWORD || 'Admin#HA2026']:      { name: 'Admin',       role: 'Administrator' },
+  [process.env.RECRUIT1_PASSWORD || 'Recruit1#HA2026']: { name: 'Recruiter 1', role: 'Recruiter' },
+  [process.env.RECRUIT2_PASSWORD || 'Recruit2#HA2026']: { name: 'Recruiter 2', role: 'Recruiter' },
+  [process.env.RECRUIT3_PASSWORD || 'Recruit3#HA2026']: { name: 'Recruiter 3', role: 'Recruiter' },
+  [process.env.RECRUIT4_PASSWORD || 'Recruit4#HA2026']: { name: 'Recruiter 4', role: 'Recruiter' },
+  [process.env.RECRUIT5_PASSWORD || 'Recruit5#HA2026']: { name: 'Recruiter 5', role: 'Recruiter' },
+};
+
+app.post('/api/gate', async (req, res) => {
+  const { password } = req.body;
+  if (!password) return res.status(400).json({ ok: false, error: 'Password required' });
+
+  // Rate limit: max 10 attempts per IP per minute
+  const ip = req.ip || req.connection.remoteAddress;
+  const key = `gate_attempts_${ip}`;
+  if (!app._gateAttempts) app._gateAttempts = {};
+  const now = Date.now();
+  if (!app._gateAttempts[key]) app._gateAttempts[key] = [];
+  app._gateAttempts[key] = app._gateAttempts[key].filter(t => now - t < 60000);
+  if (app._gateAttempts[key].length >= 10) {
+    return res.status(429).json({ ok: false, error: 'Too many attempts. Wait 1 minute.' });
+  }
+  app._gateAttempts[key].push(now);
+
+  const user = GATE_USERS[password];
+  if (user) {
+    // Generate a short-lived gate token (valid 8 hours)
+    const token = Buffer.from(JSON.stringify({
+      name: user.name, role: user.role,
+      exp: Date.now() + 8 * 60 * 60 * 1000
+    })).toString('base64');
+    return res.json({ ok: true, user, token });
+  }
+  return res.status(401).json({ ok: false, error: 'Invalid password' });
+});
+
+// ── GET /api/status — full system health check ────────────────────────────────
+app.get('/api/status', async (req, res) => {
+  const checks = { ok: true, ts: Date.now(), services: {} };
+
+  // Check Supabase
+  try {
+    await supabase.from('profiles').select('id').limit(1);
+    checks.services.database = 'ok';
+  } catch(e) {
+    checks.services.database = 'error: ' + e.message;
+    checks.ok = false;
+  }
+
+  // Check Anthropic key exists
+  checks.services.ai = process.env.ANTHROPIC_API_KEY ? 'key loaded' : 'MISSING KEY';
+  if (!process.env.ANTHROPIC_API_KEY) checks.ok = false;
+
+  res.json(checks);
+});
 
 // ── GET /api/me — get current user profile + credits ─────────────────────────
 app.get('/api/me', requireAuth, (req, res) => {
@@ -192,8 +252,36 @@ app.post('/api/chat', requireAuth, async (req, res) => {
 
     if (!anthropicRes.ok) {
       const errBody = await anthropicRes.json().catch(() => ({}));
-      return res.status(anthropicRes.status).json({
-        error: errBody.error?.message || `Anthropic API error ${anthropicRes.status}`
+      const status = anthropicRes.status;
+
+      // Rate limit — tell client to retry
+      if (status === 429) {
+        const retryAfter = anthropicRes.headers.get('retry-after') || 30;
+        return res.status(429).json({
+          error: 'rate_limited',
+          message: `Too many requests. Please wait ${retryAfter} seconds and try again.`,
+          retry_after: retryAfter
+        });
+      }
+
+      // Overloaded — Anthropic server busy
+      if (status === 529 || status === 503) {
+        return res.status(503).json({
+          error: 'ai_overloaded',
+          message: 'AI service is busy right now. Please try again in 30 seconds.'
+        });
+      }
+
+      // Bad API key
+      if (status === 401) {
+        console.error('[CRITICAL] Anthropic API key invalid or expired');
+        return res.status(500).json({
+          error: 'AI service configuration error. Contact support.'
+        });
+      }
+
+      return res.status(status).json({
+        error: errBody.error?.message || `AI error ${status}. Please try again.`
       });
     }
 
@@ -319,10 +407,57 @@ app.delete('/api/candidates', requireAuth, async (req, res) => {
   res.json({ ok: true });
 });
 
+// ── Global error handlers — prevent crashes ───────────────────────────────────
+process.on('uncaughtException', (err) => {
+  console.error('[UNCAUGHT EXCEPTION]', err.message, err.stack);
+  // Don't exit — keep server alive
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[UNHANDLED REJECTION]', reason);
+  // Don't exit — keep server alive
+});
+
+// ── 404 handler ───────────────────────────────────────────────────────────────
+app.use((req, res) => {
+  res.status(404).json({ error: 'Route not found', path: req.path });
+});
+
+// ── Global express error handler ──────────────────────────────────────────────
+app.use((err, req, res, next) => {
+  console.error('[EXPRESS ERROR]', err.message);
+  res.status(500).json({ error: 'Internal server error. Please try again.' });
+});
+
 // ── Start server ──────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`HA.AI backend running on port ${PORT}`);
-  console.log(`Anthropic key: ${process.env.ANTHROPIC_API_KEY ? '✓ loaded' : '✗ MISSING'}`);
-  console.log(`Supabase URL:  ${process.env.SUPABASE_URL ? '✓ loaded' : '✗ MISSING'}`);
+const server = app.listen(PORT, () => {
+  console.log(`✅ HA.AI backend running on port ${PORT}`);
+  console.log(`   Anthropic key : ${process.env.ANTHROPIC_API_KEY ? '✓ loaded' : '✗ MISSING — AI calls will fail'}`);
+  console.log(`   Supabase URL  : ${process.env.SUPABASE_URL ? '✓ loaded' : '✗ MISSING — auth will fail'}`);
+  console.log(`   Allowed origins: ${process.env.ALLOWED_ORIGINS || 'not set — CORS may block requests'}`);
 });
+
+// ── Keep-alive self ping — prevents Railway from sleeping ─────────────────────
+// Pings own /health every 10 minutes
+const SELF_URL = process.env.RAILWAY_STATIC_URL
+  ? `https://${process.env.RAILWAY_STATIC_URL}`
+  : `http://localhost:${PORT}`;
+
+setInterval(async () => {
+  try {
+    const res = await fetch(`${SELF_URL}/health`);
+    if (res.ok) console.log(`[keep-alive] ✓ ${new Date().toISOString()}`);
+  } catch(e) {
+    console.warn('[keep-alive] ping failed:', e.message);
+  }
+}, 10 * 60 * 1000); // every 10 minutes
+
+// ── Also ping Supabase to prevent free tier pause ─────────────────────────────
+setInterval(async () => {
+  try {
+    await supabase.from('profiles').select('id').limit(1);
+    console.log('[db-ping] ✓ Supabase alive');
+  } catch(e) {
+    console.warn('[db-ping] Supabase ping failed:', e.message);
+  }
+}, 4 * 60 * 60 * 1000); // every 4 hours
