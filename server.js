@@ -33,7 +33,7 @@ app.use(express.json({ limit: '2mb' }));
 
 // ── Credit costs per action ───────────────────────────────────────────────────
 const CREDIT_COSTS = {
-  decode:       10,   // JD decode
+  decode:       15,   // JD decode — Sonnet quality
   screen:        3,   // per CV screened
   boolean:       5,   // boolean string generation
   quick_score:   2,   // quick score a single card
@@ -243,7 +243,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model: model || 'claude-haiku-4-5-20251001',
+        model: model || 'claude-sonnet-4-6',
         max_tokens: max_tokens || 4000,
         system,
         messages
