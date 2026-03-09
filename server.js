@@ -289,7 +289,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
 
     // ✅ Success — now deduct credits
     await deductCredits(req.user.id, totalCost, action, {
-      model: model || 'claude-haiku-4-5-20251001',
+      model: model || 'claude-sonnet-4-6',
       cv_count: action === 'screen' ? cv_count : undefined
     });
 
