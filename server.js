@@ -2,12 +2,11 @@ require('dotenv').config();
 const express = require('express');
 const cors    = require('cors');
 const crypto  = require('crypto');
-const Stripe  = require('stripe');
 const { createClient } = require('@supabase/supabase-js');
 
 // ════════════════════════════════════════════════════════════════════════════
 // ── STARTUP VALIDATION
-// Core vars = crash if missing. Stripe vars = warn only (Stripe disabled).
+// Core vars = crash if missing. Stripe = warn only, routes disabled.
 // ════════════════════════════════════════════════════════════════════════════
 const CORE_ENV = [
   'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY',
@@ -20,15 +19,19 @@ if (missingCore.length > 0) {
   process.exit(1);
 }
 
-// Stripe is optional — payment routes disabled if keys missing
+// Stripe — load only if package installed AND keys present
+let Stripe = null;
+try { Stripe = require('stripe'); } catch(e) { console.warn('[STRIPE] Package not installed — run: npm install stripe'); }
+
 const STRIPE_ENABLED = !!(
+  Stripe &&
   process.env.STRIPE_SECRET_KEY &&
   process.env.STRIPE_WEBHOOK_SECRET &&
   process.env.FRONTEND_URL
 );
+
 if (!STRIPE_ENABLED) {
-  console.warn('[STRIPE] Keys not fully configured — payment routes disabled.');
-  console.warn('[STRIPE] Add STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, FRONTEND_URL to enable.');
+  console.warn('[STRIPE] Disabled. To enable: install stripe package + add STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, FRONTEND_URL');
 }
 
 const app    = express();
