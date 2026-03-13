@@ -7,21 +7,32 @@ const { createClient } = require('@supabase/supabase-js');
 
 // ════════════════════════════════════════════════════════════════════════════
 // ── STARTUP VALIDATION
+// Core vars = crash if missing. Stripe vars = warn only (Stripe disabled).
 // ════════════════════════════════════════════════════════════════════════════
-const REQUIRED_ENV = [
+const CORE_ENV = [
   'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY',
   'ANTHROPIC_API_KEY', 'GATE_HMAC_SECRET',
   'ADMIN_SECRET', 'ADMIN_EMAIL',
-  'STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'FRONTEND_URL',
 ];
-const missingEnv = REQUIRED_ENV.filter(k => !process.env[k]);
-if (missingEnv.length > 0) {
-  console.error('[FATAL] Missing required env vars:', missingEnv.join(', '));
+const missingCore = CORE_ENV.filter(k => !process.env[k]);
+if (missingCore.length > 0) {
+  console.error('[FATAL] Missing core env vars:', missingCore.join(', '));
   process.exit(1);
 }
 
+// Stripe is optional — payment routes disabled if keys missing
+const STRIPE_ENABLED = !!(
+  process.env.STRIPE_SECRET_KEY &&
+  process.env.STRIPE_WEBHOOK_SECRET &&
+  process.env.FRONTEND_URL
+);
+if (!STRIPE_ENABLED) {
+  console.warn('[STRIPE] Keys not fully configured — payment routes disabled.');
+  console.warn('[STRIPE] Add STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, FRONTEND_URL to enable.');
+}
+
 const app    = express();
-const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+const stripe = STRIPE_ENABLED ? Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -42,8 +53,10 @@ app.use(cors({
   credentials: true
 }));
 
-// ── CRITICAL: Stripe webhook must use raw body — register BEFORE express.json
-app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), handleStripeWebhook);
+// ── Stripe webhook — raw body, registered BEFORE express.json, only if enabled
+if (STRIPE_ENABLED) {
+  app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), handleStripeWebhook);
+}
 
 app.use(express.json({ limit: '2mb' }));
 
@@ -227,11 +240,13 @@ app.get('/api/credits', requireAuth, (req, res) => {
 
 // ── GET /api/stripe/packs ─────────────────────────────────────────────────
 app.get('/api/stripe/packs', (req, res) => {
+  if (!STRIPE_ENABLED) return res.status(503).json({ error: 'Payments not configured yet.' });
   res.json({ packs: Object.values(CREDIT_PACKS) });
 });
 
 // ── POST /api/stripe/checkout ─────────────────────────────────────────────
 app.post('/api/stripe/checkout', requireAuth, async (req, res) => {
+  if (!STRIPE_ENABLED) return res.status(503).json({ error: 'Payments not configured yet.' });
   const { pack_id = 'starter' } = req.body;
   const pack = CREDIT_PACKS[pack_id];
   if (!pack) return res.status(400).json({ error: 'Invalid pack' });
@@ -477,7 +492,7 @@ app.get('/api/status', async (req, res) => {
   try { await supabase.from('profiles').select('id').limit(1); checks.services.database = 'ok'; }
   catch(e) { checks.services.database = 'error'; checks.ok = false; }
   checks.services.ai     = process.env.ANTHROPIC_API_KEY ? 'ok' : 'MISSING';
-  checks.services.stripe = process.env.STRIPE_SECRET_KEY  ? 'ok' : 'MISSING';
+  checks.services.stripe = STRIPE_ENABLED ? 'ok' : 'disabled — keys not set';
   if (!process.env.ANTHROPIC_API_KEY) checks.ok = false;
   res.json(checks);
 });
@@ -491,8 +506,10 @@ process.on('unhandledRejection', reason => console.error('[UNHANDLED]', reason))
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ HA.AI v4.0 on port ${PORT}`);
-  console.log(`   Stripe  : ${process.env.STRIPE_SECRET_KEY  ? '✓' : '✗ MISSING'}`);
-  console.log(`   Frontend: ${process.env.FRONTEND_URL        || 'NOT SET'}`);
+  console.log(`   Supabase : ${process.env.SUPABASE_URL       ? '✓' : '✗ MISSING'}`);
+  console.log(`   Anthropic: ${process.env.ANTHROPIC_API_KEY  ? '✓' : '✗ MISSING'}`);
+  console.log(`   Gate key : ${process.env.GATE_HMAC_SECRET   ? '✓' : '✗ MISSING'}`);
+  console.log(`   Stripe   : ${STRIPE_ENABLED ? '✓ enabled' : '✗ disabled — add keys to enable payments'}`);
 });
 
 // Keep-alive ping (remove after upgrading Railway plan)
